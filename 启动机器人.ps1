@@ -6,11 +6,23 @@ try {
     Set-Location $projectPath
     $venvPython = Join-Path $projectPath '.venv\Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $venvPython)) {
-        $systemPython = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
-        if (-not (Test-Path -LiteralPath $systemPython)) {
-            throw 'Python 3.12 was not found. Install Python 3.10 or later first.'
+        $pythonLauncher = Get-Command 'py' -ErrorAction SilentlyContinue
+        if ($pythonLauncher) {
+            $pythonCommand = $pythonLauncher.Source
+            $pythonArguments = @('-3')
+        } else {
+            $pythonExecutable = Get-Command 'python' -ErrorAction SilentlyContinue
+            if (-not $pythonExecutable) {
+                throw 'Python was not found. Install Python 3.10 or later and enable the Python Launcher or add Python to PATH.'
+            }
+            $pythonCommand = $pythonExecutable.Source
+            $pythonArguments = @()
         }
-        & $systemPython -m venv (Join-Path $projectPath '.venv')
+        & $pythonCommand @pythonArguments -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Python 3.10 or later is required. Install Python 3.12 (recommended) and try again.'
+        }
+        & $pythonCommand @pythonArguments -m venv (Join-Path $projectPath '.venv')
         if ($LASTEXITCODE -ne 0) {
             throw "Creating the Python virtual environment failed. Exit code: $LASTEXITCODE"
         }
