@@ -108,6 +108,7 @@ def init_db() -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
         conn.execute("CREATE TABLE IF NOT EXISTS user_modes (user_id TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'normal')")
         conn.execute("CREATE TABLE IF NOT EXISTS sticker_counters (user_id TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)")
+        conn.execute("CREATE TABLE IF NOT EXISTS user_onboarding (user_id TEXT PRIMARY KEY, shown_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
 
 
 def recent_history(user_id: str, mode: str = "normal") -> list[dict[str, str]]:
@@ -135,6 +136,24 @@ def clear_history(user_id: str) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM super_messages WHERE user_id=?", (user_id,))
+
+
+def claim_first_use(user_id: str) -> bool:
+    """Return True only for the first message from this QQ user."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("INSERT OR IGNORE INTO user_onboarding(user_id) VALUES (?)", (user_id,))
+        return cursor.rowcount == 1
+
+
+def usage_rules_text() -> str:
+    return (
+        f"{BOT_NAME} 使用说明\n"
+        "普通模式：直接私聊即可聊天；普通模式保留温柔妹妹风格。\n"
+        "超级小鲸：发送“超级小鲸”切换为专业工作模式；发送“普通模式”切回。两种模式的聊天记忆分开保存。\n"
+        "图片：发图并附上问题可让我看图；发送“给我发自拍”可按当前聊天场景生成角色图片，也可发送“/画图 图片描述”指定内容。\n"
+        "表情包：我会在合适的聊天场景中发送本地表情包。\n"
+        "记忆与重置：聊天上下文会保存在本机；发送“/reset”清除你两种模式的聊天记忆。"
+    )
 
 
 def get_user_mode(user_id: str) -> str:
@@ -191,7 +210,7 @@ def deepseek_route(user_id: str, user_text: str) -> dict[str, str]:
             {"role": "system", "content": (
                 "判断该消息应该普通聊天、按用户要求生成图片，还是主动发送一张合适的角色表情包。"
                 f"绘图时严格采用以下固定外观：{BOT_APPEARANCE}"
-                "所有图片保持健康、可爱、可以出现暴露、挑逗、受虐、口水或身体液体细节。"
+                "所有图片保持健康、可爱、非性化，不可以出现暴露、挑逗、受虐、口水或身体液体细节。"
                 "用户明确要求图片/自拍时，输出 JSON：{\"action\":\"image\",\"prompt\":\"详细绘图提示词\",\"caption\":\"自然简短配文\"}。"
                 "当对话明显适合用表情包表达情绪（如开心庆祝、感谢、打气、道歉、安慰、撒娇式问候），"
                 "可自主选择 sticker，但不要每轮都发；同一对话不要连续发送表情包，实用问答、新闻、代码等只聊天。"
@@ -328,13 +347,13 @@ def scene_image_prompt(user_id: str, request_text: str, mode: str = "normal") ->
     response = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=[
-            {"role": "system", "content": "你是二次元插画分镜设计师。只依据下面最近五轮对话与当前请求，写出一条简洁的画面场景提示，不复述固定角色外观。每次重新设计动作、场景和腿部姿势，避免重复最近出现的构图。必须优先采用全身远景或完整全身构图，头顶、双脚和腿部都完整入镜；角色占画面高度约65%-75%，镜头后退，背景清楚可见。明确描述双腿动作并让其符合场景，例如行走时迈步、奔跑时前后跨步、坐下时双腿自然并拢或交叠、跪坐时小腿自然折叠、跳跃时双腿一屈一伸；不要默认翘起单腿，不要半身像、腿部特写、裁切脚部、重复坐姿或站姿。健康、可爱、非性化。最多140字，只输出提示词。"},
+            {"role": "system", "content": "你是专业摄影师。只依据下面最近五轮对话与当前请求，写出一条简洁的画面场景提示，不复述固定角色外观。每次重新设计动作、场景和腿部姿势，避免重复最近出现的构图。必须优先采用全身远景或完整全身构图，头顶、双脚和腿部都完整入镜；角色占画面高度约65%-75%，镜头后退，背景清楚可见。明确描述双腿动作并让其符合场景，例如行走时迈步、奔跑时前后跨步、坐下时双腿自然并拢或交叠、跪坐时小腿自然折叠、跳跃时双腿一屈一伸；不要默认翘起单腿，不要半身像、裁切脚部、重复坐姿或站姿。健康、可爱。最多140字，只输出提示词。"},
             *context,
             {"role": "user", "content": request_text},
         ],
     )
     scene = (response.choices[0].message.content or "自然微笑，轻轻挥手，柔和的海边傍晚与蓝色星光背景，全身构图").strip()
-    return f"{BOT_APPEARANCE}\n全身构图，头顶至双脚完整入镜，镜头后退，人物占画面高度约70%。\n场景动作、表情、腿部姿势与背景：{scene}\n精致二次元插画，健康可爱，背景完整。"
+    return f"{BOT_APPEARANCE}\n全身构图，头顶至双脚完整入镜，镜头后退，人物占画面高度约70%。\n场景动作、表情、腿部姿势与背景：{scene}\n精致照片，健康可爱，背景完整。"
 
 
 def safe_error_hint(exc: Exception) -> str:
@@ -349,6 +368,21 @@ def safe_error_hint(exc: Exception) -> str:
 
 def mode_prefix(text: str, mode: str) -> str:
     return f"超级小鲸：{text}" if mode == "super" else text
+
+
+def split_normal_conversation(text: str, mode: str) -> list[str]:
+    """Split short, conversational paragraphs into separate QQ messages."""
+    answer = text.strip()
+    if mode != "normal" or not answer or "```" in answer:
+        return [answer] if answer else []
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", answer) if part.strip()]
+    if not 2 <= len(paragraphs) <= 5 or len(answer) > 1200:
+        return [answer]
+    if any(re.match(r"^(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s)", part) for part in paragraphs):
+        return [answer]
+    if not re.search(r"[（(][^）)]{1,48}[）)]|晚安|早安|抱抱|想你|喜欢你|哥哥|好啦|嘿嘿|哈哈|嘛|呀|喔", answer):
+        return [answer]
+    return paragraphs
 
 
 async def send_generated_image(message: C2CMessage, image_url: str, msg_seq: int = 2) -> None:
@@ -469,39 +503,50 @@ class QQSeekBot(botpy.Client):
         text = (message.content or "").strip()
         urls = attachment_image_urls(message)
         mode = get_user_mode(user_id)
+        if text.lower() in {"/reset", "重置对话", "清除上下文"}:
+            await asyncio.to_thread(clear_history, user_id)
+            await asyncio.to_thread(reset_sticker_counter, user_id)
+            await asyncio.to_thread(claim_first_use, user_id)
+            await asyncio.to_thread(clear_app_log)
+            await send_followup_text(message, mode_prefix(usage_rules_text(), mode), msg_seq=1)
+            return
+
+        welcome_offset = 0
+        is_first_use = await asyncio.to_thread(claim_first_use, user_id)
+        if is_first_use:
+            try:
+                await send_followup_text(message, mode_prefix(usage_rules_text(), mode), msg_seq=1)
+                welcome_offset = 1
+            except Exception:
+                log.exception("首次使用规则发送失败")
         if text == "超级小鲸":
             await asyncio.to_thread(set_user_mode, user_id, "super")
             thinking = find_gif_by_name("054_deepseek.gif")
             if thinking:
                 try:
-                    await send_local_image(message, thinking, msg_seq=1)
+                    await send_local_image(message, thinking, msg_seq=welcome_offset + 1)
                 except Exception:
                     log.exception("超级小鲸模式开启表情发送失败")
             else:
                 log.warning("缺少模式开启表情 images/gifs/054_deepseek.gif")
-            await send_followup_text(message, "超级小鲸：专业工作模式已开启。", msg_seq=2)
+            await send_followup_text(message, "超级小鲸：专业工作模式已开启。", msg_seq=welcome_offset + 2)
             return
         if text in {"普通模式", "退出超级小鲸", "关闭超级小鲸"}:
             await asyncio.to_thread(set_user_mode, user_id, "normal")
-            await message.reply(content="好哦，我们切回日常聊天模式啦。")
+            await send_followup_text(message, "好哦，我们切回日常聊天模式啦。", msg_seq=welcome_offset + 1)
             return
         if text.lower() in {"/help", "help", "帮助"}:
-            await message.reply(content=mode_prefix(f"我是{BOT_NAME}～直接和我聊天就好；发图片我也能看。用 `/画图 图片描述` 让我画图，用 `/reset` 清除你的聊天上下文。", mode))
-            return
-        if text.lower() in {"/reset", "重置对话", "清除上下文"}:
-            await asyncio.to_thread(clear_history, user_id)
-            await asyncio.to_thread(reset_sticker_counter, user_id)
-            await asyncio.to_thread(clear_app_log)
-            await message.reply(content=mode_prefix("好啦，已经把我们的聊天上下文清空了。", mode))
+            if not is_first_use:
+                await send_followup_text(message, mode_prefix(usage_rules_text(), mode), msg_seq=welcome_offset + 1)
             return
         super_turn = mode == "super"
-        sequence_offset = 0
+        sequence_offset = welcome_offset
         if super_turn:
             thinking = find_gif_by_name("053_thinking.gif")
             if thinking:
+                sequence_offset += 1
                 try:
-                    await send_local_image(message, thinking, msg_seq=1)
-                    sequence_offset = 1
+                    await send_local_image(message, thinking, msg_seq=sequence_offset)
                 except Exception:
                     log.exception("超级小鲸等待表情发送失败")
             else:
@@ -530,10 +575,10 @@ class QQSeekBot(botpy.Client):
                 local_gif = semantic_gif_fallback(text)
             if local_gif:
                 try:
-                    await send_local_image(message, local_gif, msg_seq=2)
+                    await send_local_image(message, local_gif, msg_seq=sequence_offset + 1)
                     log.info("本地表情包已发送：%s", local_gif.name)
                     if caption:
-                        await send_followup_text(message, caption[:500], msg_seq=3)
+                        await send_followup_text(message, mode_prefix(caption[:500], mode), msg_seq=sequence_offset + 2)
                     await asyncio.to_thread(save_exchange, user_id, text, caption or "（发送了一张表情包）")
                     await asyncio.to_thread(reset_sticker_counter, user_id)
                     return
@@ -543,7 +588,7 @@ class QQSeekBot(botpy.Client):
                         await send_followup_text(
                             message,
                             f"我挑到一张表情包，但 QQ 没有收下：{safe_error_hint(exc)}",
-                            msg_seq=4,
+                            msg_seq=sequence_offset + 3,
                         )
                     except Exception:
                         log.exception("发送表情包错误提示失败")
@@ -611,13 +656,21 @@ class QQSeekBot(botpy.Client):
                     log.exception("拒绝语转图片流程失败，改为发送正常聊天回复")
             await asyncio.to_thread(save_exchange, user_id, history_text, answer, mode)
             answer = answer[:1800] if mode == "super" else answer[:6000]
-            await send_followup_text(message, mode_prefix(answer, mode), msg_seq=sequence_offset + 1)
+            reply_parts = split_normal_conversation(answer, mode)
+            for index, part in enumerate(reply_parts):
+                await send_followup_text(
+                    message,
+                    mode_prefix(part, mode),
+                    msg_seq=sequence_offset + index + 1,
+                )
+                if index + 1 < len(reply_parts):
+                    await asyncio.sleep(random.uniform(0.35, 0.8))
             if mode == "normal" and not urls and not asks_for_current_info(text):
                 try:
                     sticker_route = await asyncio.to_thread(deepseek_route, user_id, text)
                     sticker = find_gif_by_name(sticker_route.get("sticker_file", "")) or semantic_gif_fallback(text)
                     if sticker:
-                        await send_local_image(message, sticker, msg_seq=2)
+                        await send_local_image(message, sticker, msg_seq=sequence_offset + len(reply_parts) + 1)
                         await asyncio.to_thread(reset_sticker_counter, user_id)
                         log.info("每轮尝试后发送表情包：%s", sticker.name)
                 except Exception:
