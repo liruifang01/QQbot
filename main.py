@@ -9,6 +9,7 @@ import re
 import random
 import sqlite3
 import contextlib
+import uuid
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from typing import Any
@@ -61,6 +62,32 @@ BAILIAN_BASE_TEMPLATE = os.getenv(
     "BAILIAN_BASE_URL", "https://{workspace}.{region}.maas.aliyuncs.com/compatible-mode/v1"
 ).strip()
 BAILIAN_MODEL = os.getenv("BAILIAN_IMAGE_MODEL", "qwen-image-3.0-pro").strip()
+IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "forge").strip().lower()
+FORGE_API_URL = os.getenv("FORGE_API_URL", "http://127.0.0.1:7860").strip().rstrip("/")
+FORGE_API_AUTH = os.getenv("FORGE_API_AUTH", "").strip()
+FORGE_WIDTH = max(512, int(os.getenv("FORGE_WIDTH", "1024")))
+FORGE_HEIGHT = max(512, int(os.getenv("FORGE_HEIGHT", "1600")))
+FORGE_STEPS = max(1, int(os.getenv("FORGE_STEPS", "30")))
+FORGE_CFG_SCALE = float(os.getenv("FORGE_CFG_SCALE", "7"))
+FORGE_SAMPLER = os.getenv("FORGE_SAMPLER", "Euler a").strip()
+FORGE_SCHEDULER = os.getenv("FORGE_SCHEDULER", "Automatic").strip()
+FORGE_SEED = int(os.getenv("FORGE_SEED", "2829619350"))
+FORGE_DENOISING_STRENGTH = float(os.getenv("FORGE_DENOISING_STRENGTH", "0.35"))
+FORGE_CLIP_SKIP = int(os.getenv("FORGE_CLIP_SKIP", "2"))
+FORGE_ENSD = int(os.getenv("FORGE_ENSD", "31337"))
+FORGE_ETA = float(os.getenv("FORGE_ETA", "0.67"))
+FORGE_HIRES_UPSCALE = float(os.getenv("FORGE_HIRES_UPSCALE", "1.5"))
+FORGE_HIRES_STEPS = int(os.getenv("FORGE_HIRES_STEPS", "20"))
+FORGE_HIRES_UPSCALER = os.getenv("FORGE_HIRES_UPSCALER", "R-ESRGAN 4x+ Anime6B").strip()
+FORGE_HIRES_CFG = float(os.getenv("FORGE_HIRES_CFG", "7"))
+FORGE_POSITIVE_PREFIX = "masterpiece, best quality, amazing quality, (score_9, score_8_up, score_7_up), 8K,masterpiece"
+FORGE_SELFIE_BASE_PROMPT = (
+    "masterpiece, best quality, amazing quality, (score_9, score_8_up, score_7_up), "
+    "8K,masterpiece,1girl, solo, full body, DeepSeek whale girl, blue long hair, cute anime girl, "
+    "whale fin hair accessory, whale tail, white maid outfit, dark blue maid dress, "
+    "white apron,full body,maid,naughty,chest,cute,playful expression,Whale ears"
+)
+FORGE_NEGATIVE_PROMPT = "bad quality,worst quality,worst detail,sketch,censor, pubic hair,Butt facing backwards,Expose buttocks"
 BOT_NAME = os.getenv("BOT_NAME", "傻鲸鱼")
 BOT_PERSONALITY = os.getenv("BOT_PERSONALITY", "你是傻鲸鱼，温柔体贴的妹妹型聊天伙伴。")
 BOT_APPEARANCE = os.getenv("BOT_APPEARANCE", "成年海洋系蓝发女仆少女。")
@@ -115,6 +142,7 @@ def init_db() -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
         conn.execute("CREATE TABLE IF NOT EXISTS user_modes (user_id TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'normal')")
         conn.execute("CREATE TABLE IF NOT EXISTS sticker_counters (user_id TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)")
+        conn.execute("CREATE TABLE IF NOT EXISTS processed_events (message_id TEXT PRIMARY KEY, processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         conn.execute("""CREATE TABLE IF NOT EXISTS user_profiles (
             user_id TEXT PRIMARY KEY,
             personality TEXT,
@@ -122,6 +150,19 @@ def init_db() -> None:
             setup_step TEXT,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
+
+
+def claim_message_event(message_id: str) -> bool:
+    """Atomically claim an inbound QQ event so gateway retries cannot double-send."""
+    if not message_id:
+        return True
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        cursor = conn.execute("INSERT OR IGNORE INTO processed_events(message_id) VALUES (?)", (message_id,))
+        conn.execute(
+            "DELETE FROM processed_events WHERE message_id IN "
+            "(SELECT message_id FROM processed_events ORDER BY processed_at DESC, rowid DESC LIMIT -1 OFFSET 5000)"
+        )
+        return cursor.rowcount == 1
 
 
 def recent_history(user_id: str, mode: str = "normal") -> list[dict[str, str]]:
@@ -342,7 +383,126 @@ def asks_for_current_info(text: str) -> bool:
     return bool(re.search(r"新闻|今天|今日|刚刚|最近|最新|实时|现在|目前|本周|昨天|发生了什么|最新消息", text))
 
 
-def generate_image(prompt: str) -> str:
+def translate_forge_prompt(prompt: str, max_words: int | None = None) -> str:
+    """Translate prompt words into English without adding or rewriting details."""
+    client = OpenAI(api_key=DEEPSEEK_KEY, base_url=DEEPSEEK_BASE, timeout=90)
+    response = client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Translate the user's Chinese prompt into English word by word. Keep the original order, meaning, "
+                    "comma-separated tag structure, and level of detail. Translate each word or short phrase directly; "
+                    "do not add quality tags, camera instructions, style, objects, actions, or other details. Do not "
+                    "summarize, expand, reinterpret, or optimize. Preserve existing English words and model tags as-is. "
+                    "Output only the translated prompt in English, with no explanation or quotation marks."
+                    + (f" Keep the complete translation within {max_words} English words." if max_words else "")
+                ),
+            },
+            {"role": "user", "content": prompt[:4000]},
+        ],
+        max_tokens=1600,
+        temperature=0,
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+    translated = re.sub(r"\s+", " ", (response.choices[0].message.content or "")).strip(" ,")
+    if not translated:
+        raise RuntimeError("DeepSeek 没有返回英文绘图提示词")
+    if re.search(r"[^\x00-\x7F]", translated):
+        raise RuntimeError("提示词翻译结果仍含非英文字符，请重试绘图")
+    if max_words and len(re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", translated)) > max_words:
+        raise RuntimeError(f"场景补充超过{max_words}个英文单词，请重试")
+    return translated
+
+
+def generate_forge_image(prompt: str, character_prompt: str | None = None) -> Path:
+    import httpx
+
+    translated_prompt = translate_forge_prompt(prompt, max_words=10 if character_prompt else None)
+    if character_prompt == FORGE_SELFIE_BASE_PROMPT:
+        positive = f"{FORGE_SELFIE_BASE_PROMPT},{translated_prompt}"
+    else:
+        positive = f"{FORGE_POSITIVE_PREFIX}, {translated_prompt}"
+    negative = FORGE_NEGATIVE_PROMPT
+    headers: dict[str, str] = {}
+    auth = None
+    if FORGE_API_AUTH:
+        if ":" not in FORGE_API_AUTH:
+            raise RuntimeError("FORGE_API_AUTH 格式应为 username:password")
+        username, password = FORGE_API_AUTH.split(":", 1)
+        auth = (username, password)
+    payload = {
+        "prompt": positive,
+        "negative_prompt": negative,
+        "width": FORGE_WIDTH,
+        "height": FORGE_HEIGHT,
+        "steps": FORGE_STEPS,
+        "cfg_scale": FORGE_CFG_SCALE,
+        "sampler_name": FORGE_SAMPLER,
+        "scheduler": FORGE_SCHEDULER,
+        "seed": FORGE_SEED,
+        "eta": FORGE_ETA,
+        "eta_noise_seed_delta": FORGE_ENSD,
+        "randn_source": "NV",
+        "denoising_strength": FORGE_DENOISING_STRENGTH,
+        "enable_hr": True,
+        "hr_scale": FORGE_HIRES_UPSCALE,
+        "hr_upscaler": FORGE_HIRES_UPSCALER,
+        "hr_second_pass_steps": FORGE_HIRES_STEPS,
+        "hr_additional_modules": ["Use same choices"],
+        "hr_cfg": FORGE_HIRES_CFG,
+        "hr_sampler_name": FORGE_SAMPLER,
+        "hr_scheduler": FORGE_SCHEDULER,
+        "override_settings": {
+            "sd_model_checkpoint": "waiIllustriousSDXL_v120",
+            "CLIP_stop_at_last_layers": FORGE_CLIP_SKIP,
+            "eta_noise_seed_delta": FORGE_ENSD,
+            "randn_source": "NV",
+            "always_discard_next_to_last_sigma": True,
+        },
+        "override_settings_restore_afterwards": True,
+        "batch_size": 1,
+        "n_iter": 1,
+    }
+    try:
+        response = httpx.post(
+            f"{FORGE_API_URL}/sdapi/v1/txt2img",
+            json=payload,
+            headers=headers,
+            auth=auth,
+            timeout=600,
+        )
+    except httpx.ConnectError as exc:
+        raise RuntimeError(
+            "无法连接 Forge API。请在 webui-user.bat 的 COMMANDLINE_ARGS 中添加 --api，并重启 Forge。"
+        ) from exc
+    if response.status_code in (404, 405):
+        raise RuntimeError(
+            "Forge 页面可打开，但生图 API 未启用；请在 webui-user.bat 的 COMMANDLINE_ARGS 中添加 --api 并重启。"
+        )
+    if response.is_error:
+        raise RuntimeError(f"Forge 生图接口返回 HTTP {response.status_code}: {response.text[:500]}")
+    try:
+        images = response.json().get("images") or []
+        image_bytes = base64.b64decode(images[0], validate=True)
+    except (ValueError, IndexError, KeyError, TypeError) as exc:
+        raise RuntimeError("Forge API 已响应，但没有返回有效图片") from exc
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    path = GENERATED_DIR / f"forge_{uuid.uuid4().hex}.png"
+    path.write_bytes(image_bytes)
+    log.info(
+        "Forge 已生成图片：%s，正向提示词字符数=%s，负面提示词字符数=%s",
+        path.name, len(positive), len(negative),
+    )
+    return path
+
+
+def generate_image(prompt: str, character_prompt: str | None = None) -> str | Path:
+    if IMAGE_PROVIDER == "forge":
+        return generate_forge_image(prompt, character_prompt=character_prompt)
+    if IMAGE_PROVIDER != "bailian":
+        raise RuntimeError("IMAGE_PROVIDER 只支持 forge 或 bailian")
     endpoint = BAILIAN_BASE_TEMPLATE.format(workspace=BAILIAN_WORKSPACE, region=BAILIAN_REGION)
     if BAILIAN_MODEL == "z-image-turbo":
         import httpx
@@ -513,17 +673,16 @@ def likely_sticker_context(text: str) -> bool:
 def scene_image_prompt(user_id: str, request_text: str, mode: str = "normal") -> str:
     client = OpenAI(api_key=DEEPSEEK_KEY, base_url=DEEPSEEK_BASE, timeout=90)
     context = recent_history(user_id, mode)[-10:]
-    appearance = get_user_profile(user_id)["appearance"] or BOT_APPEARANCE
     response = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=[
-            {"role": "system", "content": "你是专业摄影师。只依据下面最近五轮对话与当前请求，写出一条简洁的画面场景提示，不复述固定角色外观。每次重新设计动作、场景和腿部姿势，避免重复最近出现的构图。必须优先采用全身远景或完整全身构图，头顶、双脚和腿部都完整入镜；角色占画面高度约65%-75%，镜头后退，背景清楚可见。明确描述双腿动作并让其符合场景，例如行走时迈步、奔跑时前后跨步、坐下时双腿自然并拢或交叠、跪坐时小腿自然折叠、跳跃时双腿一屈一伸；不要默认翘起单腿，不要半身像、裁切脚部、重复坐姿或站姿。健康、可爱。最多140字，不要出现手机元素，只输出提示词。"},
+            {"role": "system", "content": "只依据当前请求和最近五轮对话，给当前画面补充三个极短词组，依次表示地点、动作、表情，用逗号分隔并且只输出这三个词组。总共最多10个英文单词即可翻译。不要输出标签或说明，不要复述角色外观，不要加质量词、画风词、构图词、镜头/相机/自拍词、服装、肢体细节或其他内容。每次根据情境变化地点和动作。"},
             *context,
             {"role": "user", "content": request_text},
         ],
     )
-    scene = (response.choices[0].message.content or "自然微笑，轻轻挥手，柔和的海边傍晚与蓝色星光背景，全身构图").strip()
-    return f"{appearance}\n全身构图，头顶至双脚完整入镜，镜头后退，人物占画面高度约70%，照片内不要出现手机元素。\n场景动作、表情、腿部姿势与背景：{scene}\n精致照片，健康可爱，背景完整。"
+    scene = (response.choices[0].message.content or "海边，挥手，微笑").strip()
+    return scene
 
 
 def safe_error_hint(exc: Exception) -> str:
@@ -555,7 +714,10 @@ def split_normal_conversation(text: str, mode: str) -> list[str]:
     return paragraphs
 
 
-async def send_generated_image(message: C2CMessage, image_url: str, msg_seq: int = 2) -> None:
+async def send_generated_image(message: C2CMessage, image_url: str | Path, msg_seq: int = 2) -> None:
+    if isinstance(image_url, Path):
+        await send_local_image(message, image_url, msg_seq=msg_seq)
+        return
     media = await message._api.post_c2c_file(
         openid=message.author.user_openid,
         file_type=1,
@@ -565,6 +727,39 @@ async def send_generated_image(message: C2CMessage, image_url: str, msg_seq: int
         openid=message.author.user_openid, msg_type=7, content=" ",
         msg_id=message.id, msg_seq=msg_seq, media=media,
     )
+
+
+async def send_loading_notice(message: C2CMessage, mode: str, msg_seq: int) -> None:
+    phrases = [
+        "我想想这张图怎么画得更好看……",
+        "稍等我一下，我正在准备画面。",
+        "嗯……我挑个合适的场景和姿势，很快回来。",
+        "正在认真画啦，给我一点点时间～",
+        "让我调好颜色和构图，马上发给你。",
+        "画笔启动中……今天会画出什么样子呢？",
+    ]
+    image_candidates: list[Path] = []
+    terms = ("loading", "wait", "thinking", "think", "加载", "等待", "思考", "处理中")
+    try:
+        meanings = json.loads((GIF_DIR / "meanings.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        meanings = {}
+    for path in (GIF_DIR.iterdir() if GIF_DIR.exists() else []):
+        if path.suffix.lower() not in {".gif", ".png", ".jpg", ".jpeg"}:
+            continue
+        meaning = str(meanings.get(path.name, "")) if isinstance(meanings, dict) else ""
+        if any(term in f"{path.stem.lower()} {meaning.lower()}" for term in terms):
+            image_candidates.append(path)
+    if image_candidates and random.random() < 0.65:
+        try:
+            await send_local_image(message, random.choice(image_candidates), msg_seq=msg_seq)
+            return
+        except Exception:
+            log.exception("随机生图等待表情发送失败，改发文字提示")
+    try:
+        await send_followup_text(message, mode_prefix(random.choice(phrases), mode), msg_seq=msg_seq)
+    except Exception:
+        log.exception("随机生图等待文字发送失败，继续生图")
 
 
 def choose_local_gif(text: str, caption: str, prompt: str) -> Path | None:
@@ -664,6 +859,11 @@ class QQSeekBot(botpy.Client):
     async def on_c2c_message_create(self, message: C2CMessage) -> None:
         # Record receipt without logging QQ identifiers or private message contents.
         log.info("收到 QQ 单聊消息事件")
+        message_id = str(getattr(message, "id", "") or "")
+        claimed = await asyncio.to_thread(claim_message_event, message_id)
+        if not claimed:
+            log.info("忽略重复的 QQ 消息事件")
+            return
         async with self._message_semaphore:
             await self._process_c2c_message(message)
 
@@ -684,6 +884,14 @@ class QQSeekBot(botpy.Client):
 
         profile = await asyncio.to_thread(get_user_profile, user_id)
         step = profile["setup_step"]
+        if text in {"/形象", "设置形象", "修改形象", "更换形象"}:
+            await asyncio.to_thread(update_user_profile, user_id, setup_step="appearance")
+            await send_followup_text(
+                message,
+                mode_prefix(appearance_menu_text(), mode),
+                msg_seq=1,
+            )
+            return
         if step is None:
             await asyncio.to_thread(begin_user_setup, user_id)
             await send_followup_text(message, mode_prefix(usage_rules_text(), mode), msg_seq=1)
@@ -813,6 +1021,9 @@ class QQSeekBot(botpy.Client):
             else:
                 log.warning("缺少等待表情 images/gifs/053_thinking.gif")
         prompt = image_prompt(text)
+        character_prompt = None
+        if natural_image_request(text):
+            character_prompt = FORGE_SELFIE_BASE_PROMPT
         caption = "好啦，给你拍了一张～"
         use_sticker = False
         route: dict[str, str] = {"action": "chat", "prompt": "", "caption": ""}
@@ -859,26 +1070,26 @@ class QQSeekBot(botpy.Client):
             if not prompt:
                 await send_followup_text(message, mode_prefix("告诉我想画什么，例如：`/画图 雨夜里的二次元少女，蓝紫色霓虹`。", mode), msg_seq=sequence_offset + 1)
                 return
+            await send_loading_notice(message, mode, msg_seq=sequence_offset + 1)
             try:
-                image_url = await asyncio.to_thread(generate_image, prompt)
+                image_url = await asyncio.to_thread(generate_image, prompt, character_prompt)
             except Exception as exc:
-                log.exception("阿里云百炼图像生成 API 请求失败")
+                log.exception("图片生成 API 请求失败")
                 try:
                     await send_followup_text(
                         message,
-                        f"百炼这次没能生成图片：{safe_error_hint(exc)}请检查百炼模型权限、Workspace、地域和余额。",
-                        msg_seq=sequence_offset + 1,
+                        f"这次没能生成图片：{safe_error_hint(exc)}",
+                        msg_seq=sequence_offset + 2,
                     )
                 except Exception:
-                    log.exception("无法发送百炼生图错误提示")
+                    log.exception("无法发送图片生成错误提示")
                 return
 
             try:
-                await send_followup_text(message, mode_prefix(caption[:500], mode), msg_seq=sequence_offset + 1)
                 await send_generated_image(message, image_url, msg_seq=sequence_offset + 2)
                 log.info("QQ 图片发送接口已接受生图结果")
             except Exception as exc:
-                log.exception("图片已由百炼生成，但 QQ 富媒体发送失败")
+                log.exception("图片已生成，但 QQ 富媒体发送失败")
                 try:
                     await send_followup_text(
                         message,
@@ -910,8 +1121,11 @@ class QQSeekBot(botpy.Client):
                         text or "结合最近聊天情境生成一张合适的傻鲸鱼角色图片。",
                         mode,
                     )
-                    image_url = await asyncio.to_thread(generate_image, scene_prompt)
-                    await send_generated_image(message, image_url, msg_seq=sequence_offset + 1)
+                    await send_loading_notice(message, mode, msg_seq=sequence_offset + 1)
+                    image_url = await asyncio.to_thread(
+                        generate_image, scene_prompt, FORGE_SELFIE_BASE_PROMPT
+                    )
+                    await send_generated_image(message, image_url, msg_seq=sequence_offset + 2)
                     await asyncio.to_thread(save_exchange, user_id, history_text, "（已根据当前情境发送角色图片）")
                     return
                 except Exception:

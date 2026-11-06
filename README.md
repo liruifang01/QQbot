@@ -1,6 +1,6 @@
 # QQseek：DeepSeek QQ 聊天机器人
 
-这是一个运行在 Windows 上的 QQ 官方机器人示例项目。它通过 QQ 开放平台接收私聊消息，使用 DeepSeek 进行聊天和图片理解，使用阿里云百炼生成图片，并把每位用户的聊天上下文保存在本机 SQLite 数据库中。
+这是一个运行在 Windows 上的 QQ 官方机器人示例项目。它通过 QQ 开放平台接收私聊消息，使用 DeepSeek 进行聊天、图片理解和绘图提示词整理，默认调用本机 Stable Diffusion WebUI Forge 生成图片，并把每位用户的聊天上下文保存在本机 SQLite 数据库中。
 
 > 机器人不是普通个人 QQ 号客户端。能否收到私聊消息取决于 QQ 开放平台账号、机器人发布状态和 C2C 私聊权限。代码不能绕过平台权限；建议先在沙箱测试。
 
@@ -8,10 +8,11 @@
 
 - QQ 单聊收发消息；最多并行处理数由 `MAX_CONCURRENT_MESSAGES` 设置。
 - DeepSeek 多轮聊天、用户图片理解、新闻/实时信息关键词触发的网页搜索。
-- 阿里云百炼图片生成：支持明确的 `/画图 描述` 和自然语言自拍/生图请求。
+- 本地 Stable Diffusion WebUI Forge 图片生成（默认）：支持 `/画图 描述` 和自然语言自拍/生图请求；也可切换到阿里云百炼。
 - 从 `images/gifs/` 发送表情包，并使用 `meanings.json` 辅助匹配语义。
 - 普通模式与“超级小鲸”模式有独立聊天上下文；超级模式使用独立模型和专业工作助手提示词。
 - 每位用户首次私聊及使用 `/reset` 后都会看到使用说明，并可分别设置自己的回复性格和角色形象。
+- 发送 `/形象` 可重新选择文字形象、图片形象或项目默认形象，不清除聊天记录和性格。
 - 普通模式下，简短的日常对话若由空行分成多个自然段，会拆成多条消息逐段发送；代码、列表和较长的结构化回答保持一条消息。
 - SQLite 按 QQ 用户隔离保存上下文，机器人重启后仍保留。`/reset` 清除该用户两种模式的上下文和性格/形象设置，并清空 `logs/app.log`。
 
@@ -23,7 +24,8 @@
 
 1. **QQ 开放平台机器人**：创建机器人应用，取得 AppID 和 AppSecret，并配置单聊消息事件及沙箱测试成员。需要使用生产环境时，应先确认应用已取得所需私聊权限并按平台要求发布。
 2. **DeepSeek API**：在 DeepSeek 开放平台创建 API Key，确认账户有可用额度。默认模型为 `deepseek-flash`；超级小鲸默认使用 `deepseek-v4-pro`。
-3. **阿里云百炼**：开通图片生成模型，创建 API Key，并记下 Workspace ID 和地域。默认图片模型为 `qwen-image-3.0-pro`。图片生成可能产生单独费用。
+3. **本地 Forge 生图**：使用 Forge 启动器运行 `webui-user.bat`，在文件中将 `COMMANDLINE_ARGS` 设置为包含 `--api`，例如 `set COMMANDLINE_ARGS=--api`，然后重启 Forge。确认网页地址可打开，接口地址为 `http://127.0.0.1:7860`。在 Forge 中加载 `waiIllustriousSDXL` 检查点。
+4. **可选百炼云端生图**：如果希望改用云端，在百炼开通图片生成模型并创建 API Key，填写 Workspace ID 和地域。图片生成可能产生单独费用。
 
 DeepSeek 的模型、图片输入能力和 DeepSeek Search API 以账户当前开放情况为准，参考[官方 API 文档](https://api-docs.deepseek.com/api/create-chat-completion/)与[搜索接口文档](https://api-docs.deepseek.com/guides/search/)。百炼使用 OpenAI 兼容接口，Workspace ID、地域和模型必须与百炼控制台配置一致，参考[百炼官方说明](https://help.aliyun.com/zh/model-studio/what-is-model-studio)及[图片生成文档](https://help.aliyun.com/zh/model-studio/qwen-image-api)。
 
@@ -65,11 +67,11 @@ notepad .env
 
 | 配置项 | 填写内容 |
 |---|---|
-| `DEEPSEEK_API_KEY` | DeepSeek API Key |
 | `QQ_BOT_APP_ID` | QQ 开放平台机器人 AppID |
 | `QQ_BOT_APP_SECRET` | QQ 开放平台机器人 AppSecret |
-| `BAILIAN_API_KEY` | 阿里云百炼 API Key |
-| `BAILIAN_WORKSPACE_ID` | 百炼控制台的 Workspace ID |
+| `DEEPSEEK_API_KEY` | DeepSeek API Key；用于聊天及把绘图描述转换为英文正向/负面提示词 |
+| `BAILIAN_API_KEY` | 仅在 `IMAGE_PROVIDER=bailian` 时需要：阿里云百炼 API Key |
+| `BAILIAN_WORKSPACE_ID` | 仅在 `IMAGE_PROVIDER=bailian` 时需要：百炼控制台的 Workspace ID |
 
 其他常用配置：
 
@@ -82,6 +84,13 @@ notepad .env
 | `BAILIAN_REGION` | 百炼 Workspace 所在地域，默认 `cn-beijing` |
 | `BAILIAN_BASE_URL` | API 地址模板，通常保持 `.env.example` 中的默认值 |
 | `BAILIAN_IMAGE_MODEL` | 默认 `qwen-image-3.0-pro`；必须是当前 Workspace 已开通的模型 |
+| `IMAGE_PROVIDER` | 默认 `forge`；填写 `forge` 使用本地 Forge，填写 `bailian` 使用百炼 |
+| `FORGE_API_URL` | Forge API 根地址，默认 `http://127.0.0.1:7860` |
+| `FORGE_API_AUTH` | 可选；Forge 配置了 API Basic Auth 时填写 `用户名:密码` |
+| `FORGE_WIDTH`、`FORGE_HEIGHT` | 本地图片尺寸，默认 `1024×1600` |
+| `FORGE_STEPS`、`FORGE_CFG_SCALE`、`FORGE_SAMPLER`、`FORGE_SCHEDULER` | 默认 `30` 步、CFG `7`、`Euler a`、`Automatic` |
+| `FORGE_SEED`、`FORGE_DENOISING_STRENGTH`、`FORGE_CLIP_SKIP`、`FORGE_ENSD`、`FORGE_ETA` | 默认 seed `2829619350`、重绘幅度 `0.35`、Clip skip `2`、ENSD `31337`、Eta `0.67` |
+| `FORGE_HIRES_UPSCALE`、`FORGE_HIRES_STEPS`、`FORGE_HIRES_UPSCALER`、`FORGE_HIRES_CFG` | 默认高分修复 `1.5×`、`20` 步、`R-ESRGAN 4x+ Anime6B`、CFG `7` |
 | `MAX_CONCURRENT_MESSAGES` | 同时处理消息数量，默认 5；不代表 QQ 网关连接数 |
 | `DATABASE_PATH` | SQLite 聊天数据文件路径，默认 `./data/chat_history.sqlite3` |
 | `CONTEXT_TURNS` | 每次请求携带的历史对话轮数，默认 20 |
@@ -121,6 +130,7 @@ notepad .env
 - `帮我看看这张图` 并附带图片：测试图片理解。
 - `/画图 雨夜中的蓝发鲸鱼女仆，全身构图`：测试图片生成。
 - `给我发一张自拍`：测试自然语言触发生图。
+- `/形象`：重新选择本人的角色形象。
 - `/help`：查看帮助；`/reset`：清除自己的两种模式上下文。
 
 每位 QQ 用户首次私聊及每次 `/reset` 后都会重新显示规则与设置流程。`/reset` 还会清除该用户保存的性格和形象选择，需重新选择。
@@ -171,7 +181,11 @@ notepad .env
 
 检查 API Key 是否正确、账户余额/额度是否可用，以及 `DEEPSEEK_MODEL` 和 `DEEPSEEK_SUPER_MODEL` 是否为账户 API 当前支持的模型 ID。不要把 API Key 粘贴到日志或 issue 中。
 
-### 图片生成报 401、403、404 或模型不可用
+### 本地 Forge 图片生成提示 API 未启用或连接失败
+
+Forge 网页能打开不代表 API 已开启。检查 `webui-user.bat` 中 `COMMANDLINE_ARGS` 包含 `--api`，保存并完整重启 Forge；之后机器人会调用 `/sdapi/v1/txt2img`。如果 Forge 配置了用户名密码，将 `FORGE_API_AUTH` 设置为 `用户名:密码`。确认机器人和 Forge 在同一台电脑；如果运行在不同容器/电脑，需把 `FORGE_API_URL` 改为机器人可以访问的 Forge 地址。
+
+### 百炼图片生成报 401、403、404 或模型不可用
 
 检查百炼 API Key、Workspace ID、地域、模型名称是否来自同一个工作空间，并确认图片生成服务已开通、有余额/额度。可在百炼控制台先确认所选模型支持当前 OpenAI 兼容图像生成接口。
 
@@ -188,7 +202,7 @@ notepad .env
 1. **QQ 接入**：使用腾讯 QQ 官方机器人 Python SDK `qq-botpy` 订阅并接收 C2C 私聊事件，通过官方机器人消息接口返回文本和富媒体。
 2. **文本聊天与视觉理解**：`openai` Python SDK 以 OpenAI 兼容格式请求 DeepSeek Chat Completions；历史记录从 SQLite 按用户与模式读取，并作为上下文一并发送。图片附件以图片 URL 内容块交给视觉模型；设置角色形象时会额外让视觉模型描述图片中一位主要角色的外观。
 3. **新闻联网搜索**：识别“最新/今天/新闻/实时”等信息需求后，先调用 DeepSeek Search API 获取网页结果，再将结果和问题交给聊天模型整理回答。搜索调用与模型调用分别计费规则以 DeepSeek 控制台/官方说明为准。
-4. **图片生成**：代码根据自然语言或 `/画图` 判断绘图意图；自拍请求会先让 DeepSeek 设计近几轮场景和动作，再组合该用户选择的角色形象。随后通过百炼 OpenAI 兼容图像接口生成一张图片，并通过 QQ 富媒体接口发送。`z-image-turbo` 使用单独的百炼 REST 请求分支。
+4. **图片生成**：代码根据自然语言或 `/画图` 判断绘图意图；自拍请求会先让 DeepSeek 设计近几轮场景和动作，再组合该用户选择的角色形象。发送请求后会随机发一条等待语或等待表情。默认按用户提供的基础正向词、负面词和采样参数调用本地 Forge `/sdapi/v1/txt2img`；提示词只做逐词汉译英，不扩写。图片经 QQ 富媒体接口上传。设置 `IMAGE_PROVIDER=bailian` 可改用百炼。
 5. **表情包**：`images/gifs/` 存放本地动图，`meanings.json` 保存文件名与含义；DeepSeek 根据上下文选取表情文件，程序将文件上传到 QQ 并发送。
 6. **持久化与并发**：Python 内置 `sqlite3` 保存普通/超级两套上下文、模式状态、设置向导进度及每位用户的性格/形象；`asyncio` 处理 QQ 异步事件，线程池承载同步模型请求，Semaphore 限制消息处理并发。
 7. **配置与日志**：`python-dotenv` 从本地 `.env` 读取配置；`RotatingFileHandler` 管理应用日志。`.gitignore` 忽略密钥、聊天数据库、虚拟环境和日志。
